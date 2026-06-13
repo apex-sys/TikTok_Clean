@@ -107,6 +107,35 @@ def limpiar_order_id(valor):
 
 
 # ----------------------------------------------------------------------
+# Lectura robusta de Excel
+# ----------------------------------------------------------------------
+def leer_excel_robusto(ruta):
+    """
+    TikTok manda el Excel de dos formas distintas:
+      - Una "normal" que lee bien openpyxl.
+      - Una "rara" en la que openpyxl solo ve la primera columna
+        y hace falta el motor calamine.
+    Esta funcion prueba ambos motores y se queda con el que
+    devuelva mas de una columna (es decir, el que lee bien).
+    """
+    candidatos = []
+    for motor in ("calamine", "openpyxl"):
+        try:
+            df = pd.read_excel(ruta, dtype=str, engine=motor)
+            candidatos.append((df.shape[1], df))
+        except Exception:
+            pass
+
+    if not candidatos:
+        # ultimo recurso: dejar que pandas elija el motor por defecto
+        return pd.read_excel(ruta, dtype=str)
+
+    # quedarse con el que tenga mas columnas
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    return candidatos[0][1]
+
+
+# ----------------------------------------------------------------------
 # Programa principal
 # ----------------------------------------------------------------------
 def main():
@@ -130,7 +159,7 @@ def main():
         if ruta.suffix.lower() == ".csv":
             df = pd.read_csv(ruta, dtype=str, encoding="utf-8-sig")
         else:
-            df = pd.read_excel(ruta, dtype=str)
+            df = leer_excel_robusto(ruta)
     except Exception as e:
         messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
         return
