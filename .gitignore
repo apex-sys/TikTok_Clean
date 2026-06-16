@@ -7,3 +7,4 @@ build/
 *.xls
 *.csv
 __pycache__/
+.vscode
