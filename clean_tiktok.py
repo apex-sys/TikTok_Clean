@@ -1,17 +1,21 @@
 """
 clean_tiktok.py
-Limpia el extracto de pedidos de TikTok para cargarlo en el ERP.
+Limpia el extracto de pedidos de TikTok y genera la documentacion para el ERP.
 
 Que hace:
 1. Abre una ventana para elegir el archivo (Excel o CSV) descargado de TikTok.
 2. Quita la segunda fila de cabecera (la fila de explicaciones).
 3. Se queda solo con las columnas necesarias y las renombra en espanol.
 4. Limpia los importes (quita "EUR", convierte a numero).
-5. Calcula Precio (sin IVA, /1.21) e IVA (21%).
-6. Convierte Shipped Time a Fecha_Recogida en formato DD/MM/YYYY.
-7. Ordena por Fecha_Recogida y ID_Pedido.
-8. Elimina filas sin ID_Pedido y avisa si falta Qty.
-9. Guarda un archivo nuevo "..._LIMPIO.xlsx" junto al original.
+5. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania, etc.).
+6. Calcula Precio_Unitario (Total / Qty / 1.21) e IVA (21% del unitario).
+7. Convierte Shipped Time a Fecha_Recogida en formato DD/MM/YYYY.
+8. Ordena por Fecha_Recogida, Pais e ID_Pedido.
+9. Crea una carpeta "YYYYMMDD_N" junto al original y dentro genera:
+     - Orders_invoice.xlsx
+     - Resumen_YYYYMMDD.xlsx
+     - MANIFIESTO DE ENTREGA_SEUR_YYYYMMDD.docx  (pedidos NO Espana)
+     - MANIFIESTO DE ENTREGA_CTT_YYYYMMDD.docx   (pedidos Espana)
 """
 
 import re
@@ -19,52 +23,60 @@ import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None  # se avisa al usuario si falta python-docx
+
 
 # ----------------------------------------------------------------------
 # Configuracion
 # ----------------------------------------------------------------------
-# nombre en TikTok -> nombre para el ERP
+# nombre en TikTok -> nombre interno
 RENOMBRAR = {
     "Order ID": "ID_Pedido",
     "Seller SKU": "Codigo_Producto",
     "Quantity": "Qty",
-    "SKU Unit Original Price": "Precio_Plataforma",
-    "SKU Platform Discount": "Descuento_Plataforma",
-    "SKU Seller Discount": "Descuento_Vendedor",
-    "Original Shipping Fee": "Precio_Transporte",
-    "Shipping Fee Seller Discount": "Descuento_Vendedor_Transporte",
-    "Order Amount": "Precio_Cliente",
+    "Order Amount": "Total",
     "Shipped Time": "Fecha_Recogida",
     "Country": "Pais",
 }
 
 COLUMNAS_NECESARIAS = list(RENOMBRAR.keys())
 
-COLUMNAS_DINERO = [
-    "Precio_Plataforma",
-    "Descuento_Plataforma",
-    "Descuento_Vendedor",
-    "Precio_Transporte",
-    "Descuento_Vendedor_Transporte",
-    "Precio_Cliente",
-]
-
+# columnas de la factura (Orders_invoice), en orden
 ORDEN_FINAL = [
     "Pais",
     "ID_Pedido",
     "Fecha_Recogida",
     "Codigo_Producto",
     "Qty",
-    "Precio",
+    "Precio_Unitario",
     "IVA",
-    "Precio_Plataforma",
-    "Precio_Cliente",
-    "Precio_Transporte",
-    "Descuento_Vendedor",
-    "Descuento_Vendedor_Transporte",
-    "Descuento_Plataforma",
+    "Total",
+]
+
+# normalizacion de pais (clave en minusculas)
+MAPA_PAIS = {
+    "espana": "España",
+    "españa": "España",
+    "spain": "España",
+    "italy": "Italia",
+    "italia": "Italia",
+    "germany": "Alemania",
+    "deutschland": "Alemania",
+    "alemania": "Alemania",
+    "ireland": "Irlanda",
+    "irlanda": "Irlanda",
+}
+
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ]
 
 IVA_TIPO = 0.21  # 21%
@@ -106,6 +118,14 @@ def limpiar_order_id(valor):
     return texto if texto else None
 
 
+def normalizar_pais(valor):
+    """Aplica el mapa de paises. Si no esta en el mapa, deja el valor original."""
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    return MAPA_PAIS.get(texto.lower(), texto)
+
+
 # ----------------------------------------------------------------------
 # Lectura robusta de Excel
 # ----------------------------------------------------------------------
@@ -127,12 +147,43 @@ def leer_excel_robusto(ruta):
             pass
 
     if not candidatos:
-        # ultimo recurso: dejar que pandas elija el motor por defecto
         return pd.read_excel(ruta, dtype=str)
 
-    # quedarse con el que tenga mas columnas
     candidatos.sort(key=lambda x: x[0], reverse=True)
     return candidatos[0][1]
+
+
+# ----------------------------------------------------------------------
+# Creacion de la carpeta de salida  (Cambio 1)
+# ----------------------------------------------------------------------
+def crear_carpeta_salida(base_dir, fecha_str):
+    """Crea base_dir/YYYYMMDD_N usando el primer N libre (empezando en 1)."""
+    n = 1
+    while True:
+        carpeta = base_dir / f"{fecha_str}_{n}"
+        if not carpeta.exists():
+            carpeta.mkdir(parents=True)
+            return carpeta
+        n += 1
+
+
+# ----------------------------------------------------------------------
+# Generacion de los manifiestos Word  (Cambio 6)
+# ----------------------------------------------------------------------
+def crear_manifiesto(ruta_doc, transportista, ids, fecha_legible):
+    doc = Document()
+    doc.add_heading("MANIFIESTO DE ENTREGA – QUALITY EU", level=1)
+    doc.add_paragraph("")
+    doc.add_paragraph(f"Fecha: {fecha_legible}")
+    doc.add_paragraph(
+        f"Pedidos entregados a {transportista} del Marketplace de TikTok Shop:"
+    )
+    for pid in ids:
+        doc.add_paragraph(str(pid))
+    doc.add_paragraph("")
+    doc.add_paragraph("")
+    doc.add_paragraph("Firma QualityEU:                              Firma transportista:")
+    doc.save(ruta_doc)
 
 
 # ----------------------------------------------------------------------
@@ -152,6 +203,14 @@ def main():
     if not archivo:
         return
 
+    if Document is None:
+        messagebox.showerror(
+            "Falta una libreria",
+            "No se encuentra 'python-docx', necesaria para los manifiestos Word.\n\n"
+            "Instalala con:  pip install python-docx",
+        )
+        return
+
     ruta = Path(archivo)
 
     # ---- Leer (todo como texto para no perder los ID de pedido) ----
@@ -164,6 +223,10 @@ def main():
         messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
         return
 
+    # ---- Quitar columnas vacias / "Unnamed" que arrastra Excel ----
+    df = df.drop(columns=[c for c in df.columns if str(c).startswith("Unnamed")])
+    df = df.dropna(axis=1, how="all")
+
     # ---- Quitar la segunda fila de cabecera (explicaciones) ----
     if len(df) > 0:
         valor = str(df.iloc[0].get("Order ID", "")).strip()
@@ -173,78 +236,167 @@ def main():
     # ---- Comprobar columnas ----
     faltan = [c for c in COLUMNAS_NECESARIAS if c not in df.columns]
     if faltan:
-        messagebox.showerror(
-            "Faltan columnas",
-            "El archivo no tiene estas columnas:\n\n- " + "\n- ".join(faltan)
-            + "\n\nColumnas encontradas:\n" + ", ".join(df.columns),
-        )
+        # Caso tipico: se ha elegido un archivo ya procesado por este programa
+        nombres_procesado = {"ID_Pedido", "Codigo_Producto", "Precio_Unitario"}
+        if nombres_procesado.intersection(df.columns):
+            messagebox.showerror(
+                "Archivo equivocado",
+                "Parece que has seleccionado un archivo YA PROCESADO "
+                "(por ejemplo 'Orders_invoice.xlsx').\n\n"
+                "Tienes que seleccionar el archivo ORIGINAL descargado de TikTok "
+                "(el que tiene columnas en ingles: Order ID, Seller SKU, ...).",
+            )
+        else:
+            messagebox.showerror(
+                "Faltan columnas",
+                "El archivo no tiene estas columnas:\n\n- " + "\n- ".join(faltan)
+                + "\n\nColumnas encontradas:\n" + ", ".join(map(str, df.columns)),
+            )
         return
 
     df = df[COLUMNAS_NECESARIAS].copy()
     df = df.rename(columns=RENOMBRAR)
     filas_iniciales = len(df)
 
-    # ---- Limpieza ----
+    # ---- Limpieza basica ----
     df["ID_Pedido"] = df["ID_Pedido"].apply(limpiar_order_id)
     df = df[df["ID_Pedido"].notna()].reset_index(drop=True)
     filas_sin_id = filas_iniciales - len(df)
 
-    df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce")
-    filas_sin_qty = int(df["Qty"].isna().sum())
-    df["Qty"] = df["Qty"].astype("Int64")
+    qty = pd.to_numeric(df["Qty"], errors="coerce")
+    filas_sin_qty = int(qty.isna().sum())
+    df["Qty"] = qty.astype("Int64")   # entero limpio para la factura
 
-    for col in COLUMNAS_DINERO:
-        df[col] = df[col].apply(limpiar_dinero)
+    df["Total"] = pd.to_numeric(df["Total"].map(limpiar_dinero), errors="coerce")
 
     # fecha real (para ordenar bien) y luego texto DD/MM/YYYY
     fecha_real = pd.to_datetime(df["Fecha_Recogida"], errors="coerce", dayfirst=False)
     df["Fecha_Recogida"] = fecha_real.dt.strftime("%d/%m/%Y")
 
-    df["Pais"] = df["Pais"].fillna("").astype(str).str.strip()
+    # ---- Normalizar pais (Cambio 3) ----
+    df["Pais"] = df["Pais"].apply(normalizar_pais)
 
-    # ---- Calculos: Precio sin IVA e IVA ----
-    base = df["Precio_Cliente"] / (1 + IVA_TIPO)
-    df["Precio"] = base.round(2)
-    df["IVA"] = (base * IVA_TIPO).round(2)
+    # ---- Calculos: Precio_Unitario e IVA (Cambio 2) ----
+    qty_safe = qty.replace(0, pd.NA)          # evita division por cero
+    precio_unitario = df["Total"] / qty_safe / (1 + IVA_TIPO)
+    df["Precio_Unitario"] = precio_unitario.round(2)
+    df["IVA"] = (precio_unitario * IVA_TIPO).round(2)
 
-    # ---- Ordenar por fecha y pedido ----
+    # ---- Ordenar por fecha, pais y pedido (Cambio 4) ----
     df["_orden_fecha"] = fecha_real
-    df = df.sort_values(by=["_orden_fecha", "ID_Pedido"], na_position="last")
+    df = df.sort_values(
+        by=["_orden_fecha", "Pais", "ID_Pedido"], na_position="last"
+    )
     df = df.drop(columns=["_orden_fecha"]).reset_index(drop=True)
 
-    # ---- Orden final de columnas ----
-    df = df[ORDEN_FINAL]
+    # ---- Factura final (Orders_invoice) ----
+    factura = df[ORDEN_FINAL].copy()
 
-    # ---- Guardar ----
-    salida = ruta.with_name(ruta.stem + "_LIMPIO.xlsx")
+    # ====================================================================
+    # SALIDA
+    # ====================================================================
+    hoy = datetime.now()
+    fecha_str = hoy.strftime("%Y%m%d")
+    fecha_legible = f"{hoy.day} de {MESES_ES[hoy.month - 1]} de {hoy.year}"
+
+    carpeta = crear_carpeta_salida(ruta.parent, fecha_str)
+
+    orders_path = carpeta / "Orders_invoice.xlsx"
+    resumen_path = carpeta / f"Resumen_{fecha_str}.xlsx"
+    seur_path = carpeta / f"MANIFIESTO DE ENTREGA_SEUR_{fecha_str}.docx"
+    ctt_path = carpeta / f"MANIFIESTO DE ENTREGA_CTT_{fecha_str}.docx"
+
+    # ---- Orders_invoice.xlsx ----
     try:
-        with pd.ExcelWriter(salida, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Pedidos")
+        with pd.ExcelWriter(orders_path, engine="openpyxl") as writer:
+            factura.to_excel(writer, index=False, sheet_name="Pedidos")
             hoja = writer.sheets["Pedidos"]
-            # forzar ID_Pedido (columna B) como texto en Excel
+            # ID_Pedido es la columna B -> forzar texto
             for celda in hoja["B"]:
                 celda.number_format = "@"
+            # Qty (E) como entero
+            for celda in hoja["E"][1:]:  # saltar cabecera
+                celda.number_format = "0"
+            # importes con 2 decimales (F=Precio_Unitario, G=IVA, H=Total)
+            for col_letra in ("F", "G", "H"):
+                for celda in hoja[col_letra][1:]:  # saltar cabecera
+                    celda.number_format = "0.00"
     except PermissionError:
         messagebox.showerror(
             "Error",
-            f"No se pudo guardar:\n{salida}\n\n"
-            "Probablemente el archivo esta abierto en Excel. Cierralo y vuelve a intentarlo.",
+            f"No se pudo guardar:\n{orders_path}\n\n"
+            "Probablemente el archivo esta abierto en Excel. Cierralo y reintenta.",
         )
         return
     except Exception as e:
-        messagebox.showerror("Error", f"No se pudo guardar el archivo:\n{e}")
+        messagebox.showerror("Error", f"No se pudo guardar Orders_invoice:\n{e}")
         return
 
-    # ---- Resumen ----
+    # ---- Calculo del resumen (Cambio 5) ----
+    # Order Amount es a nivel de pedido: se toma una sola vez por ID_Pedido
+    es_espana = df["Pais"] == "España"
+    pedidos_esp = df[es_espana].drop_duplicates(subset="ID_Pedido")
+    pedidos_ext = df[~es_espana].drop_duplicates(subset="ID_Pedido")
+
+    esp_total = float(pedidos_esp["Total"].sum())
+    ext_total = float(pedidos_ext["Total"].sum())
+    esp_sin_iva = esp_total / (1 + IVA_TIPO)
+    ext_sin_iva = ext_total / (1 + IVA_TIPO)
+    esp_n = int(pedidos_esp["ID_Pedido"].nunique())
+    ext_n = int(pedidos_ext["ID_Pedido"].nunique())
+
+    filas_resumen = [
+        ("España sin IVA", round(esp_sin_iva, 2)),
+        ("España Total", round(esp_total, 2)),
+        ("Numero de pedidos", esp_n),
+        ("Extranjero sin IVA", round(ext_sin_iva, 2)),
+        ("Extranjero Total", round(ext_total, 2)),
+        ("Numero de pedidos", ext_n),
+    ]
+
+    try:
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Resumen"
+        for i, (etiqueta, valor) in enumerate(filas_resumen, start=1):
+            ws.cell(row=i, column=1, value=etiqueta)
+            ws.cell(row=i, column=2, value=valor)
+        wb.save(resumen_path)
+    except Exception as e:
+        messagebox.showerror("Error", f"No se pudo guardar el Resumen:\n{e}")
+        return
+
+    # ---- Manifiestos Word (Cambio 6) ----
+    # df ya esta ordenado; drop_duplicates conserva ese orden
+    ids_espana = df.loc[es_espana, "ID_Pedido"].drop_duplicates().tolist()
+    ids_extranjero = df.loc[~es_espana, "ID_Pedido"].drop_duplicates().tolist()
+
+    try:
+        # SEUR -> extranjero (NO Espana)
+        crear_manifiesto(seur_path, "SEUR", ids_extranjero, fecha_legible)
+        # CTT -> Espana
+        crear_manifiesto(ctt_path, "CTT", ids_espana, fecha_legible)
+    except Exception as e:
+        messagebox.showerror("Error", f"No se pudieron crear los manifiestos:\n{e}")
+        return
+
+    # ---- Resumen final ----
     mensaje = (
-        f"Archivo creado:\n{salida}\n\n"
-        f"Pedidos procesados: {len(df)}\n"
+        f"Carpeta creada:\n{carpeta}\n\n"
+        f"Archivos generados:\n"
+        f"  - {orders_path.name}\n"
+        f"  - {resumen_path.name}\n"
+        f"  - {seur_path.name}\n"
+        f"  - {ctt_path.name}\n\n"
+        f"Lineas procesadas: {len(factura)}\n"
+        f"Pedidos España: {esp_n}    Pedidos extranjero: {ext_n}\n"
         f"Filas eliminadas sin ID_Pedido: {filas_sin_id}"
     )
     if filas_sin_qty > 0:
         mensaje += (
             f"\n\nATENCION: {filas_sin_qty} fila(s) sin Qty. "
-            "Revisalas en el archivo antes de cargarlo al ERP."
+            "Revisalas (el Precio_Unitario no se pudo calcular)."
         )
     messagebox.showinfo("Listo", mensaje)
 
