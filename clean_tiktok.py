@@ -215,13 +215,19 @@ def _construir_cabecera(header, transportista, n_paquetes, fecha_corta):
 
     header.add_paragraph("")
 
-    # ---- Tabla 2 (sin bordes): total | nombre transportista + firmas ----
+    # ---- Tabla 2 (sin bordes):
+    #   Izquierda: Total (arriba)  + Firma Vendedor (abajo)
+    #   Derecha:   Nombre del Transportista (arriba) + Firma Transportista (abajo)
     t2 = header.add_table(rows=1, cols=2, width=Cm(17))
     ci, cd = t2.cell(0, 0), t2.cell(0, 1)
+
     ci.paragraphs[0].add_run(f"Total de paquetes Entregados: {n_paquetes}")
+    ci.add_paragraph("")
+    ci.add_paragraph("Firma Vendedor:")
+
     cd.paragraphs[0].add_run("Nombre del Transportista: ______________________")
+    cd.add_paragraph("")
     cd.add_paragraph("Firma Transportista:")
-    cd.add_paragraph("Firma Vendedor:")
 
     # ---- Aviso (en rojo y negrita) ----
     aviso = header.add_paragraph()
