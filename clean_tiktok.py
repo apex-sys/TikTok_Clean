@@ -29,8 +29,10 @@ import pandas as pd
 
 try:
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, Cm, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
 except ImportError:
     Document = None  # se avisa al usuario si falta python-docx
 
@@ -180,21 +182,22 @@ def crear_carpeta_salida(base_dir, fecha_str):
 # ----------------------------------------------------------------------
 # Generacion de los manifiestos Word
 # ----------------------------------------------------------------------
-def crear_manifiesto(ruta_doc, transportista, pares, fecha_corta):
-    """
-    Crea un manifiesto de entrega.
+def _marcar_fila_cabecera(row):
+    """Hace que esta fila de la tabla se repita como cabecera en cada pagina."""
+    trPr = row._tr.get_or_add_trPr()
+    th = OxmlElement("w:tblHeader")
+    th.set(qn("w:val"), "true")
+    trPr.append(th)
 
-    transportista : "CTT" o "SEUR" (se muestra arriba a la izquierda).
-    pares         : lista de tuplas (ID_Pedido, Tracking).
-    fecha_corta   : texto DD/MM/YYYY.
-    """
-    doc = Document()
 
-    # ---- Cabecera: tabla SIN bordes de 2 columnas ----
-    cab = doc.add_table(rows=1, cols=2)
-    cab.autofit = True
-    izq = cab.cell(0, 0)
-    der = cab.cell(0, 1)
+def _construir_cabecera(header, transportista, n_paquetes, fecha_corta):
+    """Rellena la cabecera de pagina (se repite automaticamente en todas las hojas)."""
+    # parrafo vacio inicial que trae el header por defecto
+    header.paragraphs[0].text = ""
+
+    # ---- Tabla 1 (sin bordes): transportista | MANIFIESTO + fecha ----
+    t1 = header.add_table(rows=1, cols=2, width=Cm(17))
+    izq, der = t1.cell(0, 0), t1.cell(0, 1)
 
     r_izq = izq.paragraphs[0].add_run(transportista)
     r_izq.bold = True
@@ -210,17 +213,43 @@ def crear_manifiesto(ruta_doc, transportista, pares, fecha_corta):
     p_der2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     p_der2.add_run(f"Fecha Entrega: {fecha_corta}")
 
-    doc.add_paragraph("")
+    header.add_paragraph("")
 
-    # ---- Total + firmas: tabla SIN bordes de 2 columnas ----
-    info = doc.add_table(rows=1, cols=2)
-    ci = info.cell(0, 0)
-    cd = info.cell(0, 1)
-    ci.paragraphs[0].add_run(f"Total de paquetes Entregados: {len(pares)}")
-    cd.paragraphs[0].add_run("Firma Transportista:")
+    # ---- Tabla 2 (sin bordes): total | nombre transportista + firmas ----
+    t2 = header.add_table(rows=1, cols=2, width=Cm(17))
+    ci, cd = t2.cell(0, 0), t2.cell(0, 1)
+    ci.paragraphs[0].add_run(f"Total de paquetes Entregados: {n_paquetes}")
+    cd.paragraphs[0].add_run("Nombre del Transportista: ______________________")
+    cd.add_paragraph("Firma Transportista:")
     cd.add_paragraph("Firma Vendedor:")
 
-    doc.add_paragraph("")
+    # ---- Aviso (en rojo y negrita) ----
+    aviso = header.add_paragraph()
+    r_av = aviso.add_run("Por favor, firmar en todas las hojas")
+    r_av.bold = True
+    r_av.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+
+
+def crear_manifiesto(ruta_doc, transportista, pares, fecha_corta):
+    """
+    Crea un manifiesto de entrega.
+
+    transportista : "CTT" o "SEUR" (se muestra arriba a la izquierda).
+    pares         : lista de tuplas (ID_Pedido, Tracking).
+    fecha_corta   : texto DD/MM/YYYY.
+
+    La cabecera (transportista, MANIFIESTO, fecha, total, nombre y firmas
+    del transportista, firma del vendedor y el aviso) se coloca en la
+    cabecera de pagina, de modo que se repite en TODAS las hojas.
+    La fila de titulos de la tabla tambien se repite en cada pagina.
+    """
+    doc = Document()
+    sec = doc.sections[0]
+    # margen superior amplio para dejar sitio a la cabecera repetida
+    sec.top_margin = Cm(5.8)
+    sec.header_distance = Cm(0.8)
+
+    _construir_cabecera(sec.header, transportista, len(pares), fecha_corta)
 
     # ---- Tabla de datos (CON bordes): Numero de Pedido + Numero de seguimiento ----
     tabla = doc.add_table(rows=1, cols=2)
@@ -228,6 +257,7 @@ def crear_manifiesto(ruta_doc, transportista, pares, fecha_corta):
     hdr = tabla.rows[0].cells
     hdr[0].paragraphs[0].add_run("Numero de Pedido").bold = True
     hdr[1].paragraphs[0].add_run("Numero de seguimiento").bold = True
+    _marcar_fila_cabecera(tabla.rows[0])   # repetir titulos en cada pagina
 
     for pid, track in pares:
         fila = tabla.add_row().cells
