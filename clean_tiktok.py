@@ -29,6 +29,8 @@ import pandas as pd
 
 try:
     from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
 except ImportError:
     Document = None  # se avisa al usuario si falta python-docx
 
@@ -109,7 +111,7 @@ def limpiar_dinero(valor):
 
 
 def limpiar_order_id(valor):
-    """ID_Pedido como texto limpio (evita notacion cientifica y '.0' de Excel)."""
+    """ID_Pedido / tracking como texto limpio (evita notacion cientifica y '.0')."""
     if pd.isna(valor):
         return None
     texto = str(valor).strip()
@@ -124,6 +126,14 @@ def normalizar_pais(valor):
         return ""
     texto = str(valor).strip()
     return MAPA_PAIS.get(texto.lower(), texto)
+
+
+def detectar_columna_tracking(columnas):
+    """Busca la columna de seguimiento (Tracking ID, Tracking Number, ...)."""
+    for c in columnas:
+        if "tracking" in str(c).lower():
+            return c
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -168,21 +178,62 @@ def crear_carpeta_salida(base_dir, fecha_str):
 
 
 # ----------------------------------------------------------------------
-# Generacion de los manifiestos Word  (Cambio 6)
+# Generacion de los manifiestos Word
 # ----------------------------------------------------------------------
-def crear_manifiesto(ruta_doc, transportista, ids, fecha_legible):
+def crear_manifiesto(ruta_doc, transportista, pares, fecha_corta):
+    """
+    Crea un manifiesto de entrega.
+
+    transportista : "CTT" o "SEUR" (se muestra arriba a la izquierda).
+    pares         : lista de tuplas (ID_Pedido, Tracking).
+    fecha_corta   : texto DD/MM/YYYY.
+    """
     doc = Document()
-    doc.add_heading("MANIFIESTO DE ENTREGA – QUALITY EU", level=1)
+
+    # ---- Cabecera: tabla SIN bordes de 2 columnas ----
+    cab = doc.add_table(rows=1, cols=2)
+    cab.autofit = True
+    izq = cab.cell(0, 0)
+    der = cab.cell(0, 1)
+
+    r_izq = izq.paragraphs[0].add_run(transportista)
+    r_izq.bold = True
+    r_izq.font.size = Pt(14)
+
+    p_der1 = der.paragraphs[0]
+    p_der1.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    r_der1 = p_der1.add_run("MANIFIESTO DE ENTREGA")
+    r_der1.bold = True
+    r_der1.font.size = Pt(14)
+
+    p_der2 = der.add_paragraph()
+    p_der2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p_der2.add_run(f"Fecha Entrega: {fecha_corta}")
+
     doc.add_paragraph("")
-    doc.add_paragraph(f"Fecha: {fecha_legible}")
-    doc.add_paragraph(
-        f"Pedidos entregados a {transportista} del Marketplace de TikTok Shop:"
-    )
-    for pid in ids:
-        doc.add_paragraph(str(pid))
+
+    # ---- Total + firmas: tabla SIN bordes de 2 columnas ----
+    info = doc.add_table(rows=1, cols=2)
+    ci = info.cell(0, 0)
+    cd = info.cell(0, 1)
+    ci.paragraphs[0].add_run(f"Total de paquetes Entregados: {len(pares)}")
+    cd.paragraphs[0].add_run("Firma Transportista:")
+    cd.add_paragraph("Firma Vendedor:")
+
     doc.add_paragraph("")
-    doc.add_paragraph("")
-    doc.add_paragraph("Firma QualityEU:                              Firma transportista:")
+
+    # ---- Tabla de datos (CON bordes): Numero de Pedido + Numero de seguimiento ----
+    tabla = doc.add_table(rows=1, cols=2)
+    tabla.style = "Table Grid"
+    hdr = tabla.rows[0].cells
+    hdr[0].paragraphs[0].add_run("Numero de Pedido").bold = True
+    hdr[1].paragraphs[0].add_run("Numero de seguimiento").bold = True
+
+    for pid, track in pares:
+        fila = tabla.add_row().cells
+        fila[0].text = "" if pid is None else str(pid)
+        fila[1].text = "" if track is None else str(track)
+
     doc.save(ruta_doc)
 
 
@@ -254,8 +305,18 @@ def main():
             )
         return
 
-    df = df[COLUMNAS_NECESARIAS].copy()
+    # ---- Detectar la columna de seguimiento (tracking) ----
+    col_tracking = detectar_columna_tracking(df.columns)
+
+    cols_a_usar = COLUMNAS_NECESARIAS + ([col_tracking] if col_tracking else [])
+    df = df[cols_a_usar].copy()
     df = df.rename(columns=RENOMBRAR)
+    if col_tracking:
+        df = df.rename(columns={col_tracking: "Tracking"})
+    else:
+        df["Tracking"] = ""
+    df["Tracking"] = df["Tracking"].apply(limpiar_order_id)
+
     filas_iniciales = len(df)
 
     # ---- Limpieza basica ----
@@ -298,6 +359,7 @@ def main():
     hoy = datetime.now()
     fecha_str = hoy.strftime("%Y%m%d")
     fecha_legible = f"{hoy.day} de {MESES_ES[hoy.month - 1]} de {hoy.year}"
+    fecha_corta = hoy.strftime("%d/%m/%Y")   # para los manifiestos
 
     carpeta = crear_carpeta_salida(ruta.parent, fecha_str)
 
@@ -367,16 +429,21 @@ def main():
         messagebox.showerror("Error", f"No se pudo guardar el Resumen:\n{e}")
         return
 
-    # ---- Manifiestos Word (Cambio 6) ----
-    # df ya esta ordenado; drop_duplicates conserva ese orden
-    ids_espana = df.loc[es_espana, "ID_Pedido"].drop_duplicates().tolist()
-    ids_extranjero = df.loc[~es_espana, "ID_Pedido"].drop_duplicates().tolist()
+    # ---- Manifiestos Word ----
+    # df ya esta ordenado; drop_duplicates conserva ese orden.
+    # Un pedido = un paquete -> una fila por ID_Pedido con su tracking.
+    man_esp = (df.loc[es_espana, ["ID_Pedido", "Tracking"]]
+                 .drop_duplicates(subset="ID_Pedido"))
+    man_ext = (df.loc[~es_espana, ["ID_Pedido", "Tracking"]]
+                 .drop_duplicates(subset="ID_Pedido"))
+    pares_espana = list(man_esp.itertuples(index=False, name=None))
+    pares_extranjero = list(man_ext.itertuples(index=False, name=None))
 
     try:
         # SEUR -> extranjero (NO Espana)
-        crear_manifiesto(seur_path, "SEUR", ids_extranjero, fecha_legible)
+        crear_manifiesto(seur_path, "SEUR", pares_extranjero, fecha_corta)
         # CTT -> Espana
-        crear_manifiesto(ctt_path, "CTT", ids_espana, fecha_legible)
+        crear_manifiesto(ctt_path, "CTT", pares_espana, fecha_corta)
     except Exception as e:
         messagebox.showerror("Error", f"No se pudieron crear los manifiestos:\n{e}")
         return
@@ -397,6 +464,11 @@ def main():
         mensaje += (
             f"\n\nATENCION: {filas_sin_qty} fila(s) sin Qty. "
             "Revisalas (el Precio_Unitario no se pudo calcular)."
+        )
+    if not col_tracking:
+        mensaje += (
+            "\n\nATENCION: no se encontro la columna de seguimiento (Tracking) "
+            "en el archivo; los manifiestos saldran SIN numero de seguimiento."
         )
     messagebox.showinfo("Listo", mensaje)
 
