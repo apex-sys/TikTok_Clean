@@ -5,17 +5,24 @@ Limpia el extracto de pedidos de TikTok y genera la documentacion para el ERP.
 Que hace:
 1. Abre una ventana para elegir el archivo (Excel o CSV) descargado de TikTok.
 2. Quita la segunda fila de cabecera (la fila de explicaciones).
-3. Se queda solo con las columnas necesarias y las renombra en espanol.
+3. Se queda solo con las columnas necesarias (incluida la de seguimiento /
+   Tracking, que es obligatoria) y las renombra en espanol.
 4. Limpia los importes (quita "EUR", convierte a numero).
-5. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania, etc.).
-6. Calcula Precio_Unitario (Total / Qty / 1.21) e IVA (21% del unitario).
+5. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania,
+   Österreich -> Austria, etc.).
+6. Calcula Precio_Unitario e IVA (21% del unitario):
+     Precio_Unitario = (SKU Subtotal Before Discount - SKU Seller Discount
+                        + Original Shipping Fee - Shipping Fee Seller Discount)
+                       / Qty / 1.21
+   Anade Tipo_IVA (21%) y Total = (Precio_Unitario + IVA) * Qty.
 7. Convierte Shipped Time a Fecha_Recogida en formato DD/MM/YYYY.
-8. Ordena por Fecha_Recogida, Pais e ID_Pedido.
+8. Ordena por Pais, Qty (de mayor a menor), Fecha_Recogida e ID_Pedido.
 9. Crea una carpeta "YYYYMMDD_N" junto al original y dentro genera:
      - Orders_invoice.xlsx
      - Resumen_YYYYMMDD.xlsx
      - MANIFIESTO DE ENTREGA_SEUR_YYYYMMDD.docx  (pedidos NO Espana)
      - MANIFIESTO DE ENTREGA_CTT_YYYYMMDD.docx   (pedidos Espana)
+10. Avisa de pedidos sin pais y de pedidos con varias lineas (varios SKU).
 """
 
 import re
@@ -45,12 +52,22 @@ RENOMBRAR = {
     "Order ID": "ID_Pedido",
     "Seller SKU": "Codigo_Producto",
     "Quantity": "Qty",
-    "Order Amount": "Total",
+    "Order Amount": "Order_Amount",
     "Shipped Time": "Fecha_Recogida",
     "Country": "Pais",
+    # importes para calcular Precio_Unitario
+    "SKU Subtotal Before Discount": "Subtotal_SKU",
+    "SKU Seller Discount": "Descuento_SKU",
+    "Original Shipping Fee": "Envio",
+    "Shipping Fee Seller Discount": "Descuento_Envio",
 }
 
+# importes que, si vienen vacios, cuentan como 0
+IMPORTES_OPCIONALES = ["Descuento_SKU", "Envio", "Descuento_Envio"]
+
 COLUMNAS_NECESARIAS = list(RENOMBRAR.keys())
+# Ademas es obligatoria una columna de seguimiento (cualquier columna
+# cuyo nombre contenga "tracking", p. ej. "Tracking ID").
 
 # columnas de la factura (Orders_invoice), en orden
 ORDEN_FINAL = [
@@ -61,6 +78,7 @@ ORDEN_FINAL = [
     "Qty",
     "Precio_Unitario",
     "IVA",
+    "Tipo_IVA",
     "Total",
 ]
 
@@ -76,6 +94,10 @@ MAPA_PAIS = {
     "alemania": "Alemania",
     "ireland": "Irlanda",
     "irlanda": "Irlanda",
+    "austria": "Austria",
+    "österreich": "Austria",
+    "osterreich": "Austria",
+    "oesterreich": "Austria",
 }
 
 MESES_ES = [
@@ -83,7 +105,9 @@ MESES_ES = [
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ]
 
-IVA_TIPO = 0.21  # 21%
+IVA_TIPO = 0.21  # 21% (provisional: se cambiara mas adelante)
+
+MAX_IDS_EN_AVISO = 10  # cuantos ID de pedido se listan en cada aviso
 
 
 # ----------------------------------------------------------------------
@@ -138,6 +162,15 @@ def detectar_columna_tracking(columnas):
     return None
 
 
+def lista_ids(ids):
+    """Texto con los primeros ID de pedido (para los avisos)."""
+    ids = list(ids)
+    texto = ", ".join(map(str, ids[:MAX_IDS_EN_AVISO]))
+    if len(ids) > MAX_IDS_EN_AVISO:
+        texto += f" ... (y {len(ids) - MAX_IDS_EN_AVISO} mas)"
+    return texto
+
+
 # ----------------------------------------------------------------------
 # Lectura robusta de Excel
 # ----------------------------------------------------------------------
@@ -166,7 +199,7 @@ def leer_excel_robusto(ruta):
 
 
 # ----------------------------------------------------------------------
-# Creacion de la carpeta de salida  (Cambio 1)
+# Creacion de la carpeta de salida
 # ----------------------------------------------------------------------
 def crear_carpeta_salida(base_dir, fecha_str):
     """Crea base_dir/YYYYMMDD_N usando el primer N libre (empezando en 1)."""
@@ -320,8 +353,13 @@ def main():
         if not re.fullmatch(r"\d{6,}", valor.replace(".0", "")):
             df = df.iloc[1:].reset_index(drop=True)
 
-    # ---- Comprobar columnas ----
+    # ---- Comprobar columnas (Tracking incluido, es obligatorio) ----
+    col_tracking = detectar_columna_tracking(df.columns)
+
     faltan = [c for c in COLUMNAS_NECESARIAS if c not in df.columns]
+    if col_tracking is None:
+        faltan.append("Tracking ID (o cualquier columna con 'tracking' en el nombre)")
+
     if faltan:
         # Caso tipico: se ha elegido un archivo ya procesado por este programa
         nombres_procesado = {"ID_Pedido", "Codigo_Producto", "Precio_Unitario"}
@@ -341,16 +379,9 @@ def main():
             )
         return
 
-    # ---- Detectar la columna de seguimiento (tracking) ----
-    col_tracking = detectar_columna_tracking(df.columns)
-
-    cols_a_usar = COLUMNAS_NECESARIAS + ([col_tracking] if col_tracking else [])
-    df = df[cols_a_usar].copy()
+    df = df[COLUMNAS_NECESARIAS + [col_tracking]].copy()
     df = df.rename(columns=RENOMBRAR)
-    if col_tracking:
-        df = df.rename(columns={col_tracking: "Tracking"})
-    else:
-        df["Tracking"] = ""
+    df = df.rename(columns={col_tracking: "Tracking"})
     df["Tracking"] = df["Tracking"].apply(limpiar_order_id)
 
     filas_iniciales = len(df)
@@ -364,27 +395,55 @@ def main():
     filas_sin_qty = int(qty.isna().sum())
     df["Qty"] = qty.astype("Int64")   # entero limpio para la factura
 
-    df["Total"] = pd.to_numeric(df["Total"].map(limpiar_dinero), errors="coerce")
+    df["Order_Amount"] = pd.to_numeric(
+        df["Order_Amount"].map(limpiar_dinero), errors="coerce"
+    )
+
+    # importes por linea (SKU) para el Precio_Unitario
+    for col in ["Subtotal_SKU"] + IMPORTES_OPCIONALES:
+        df[col] = pd.to_numeric(df[col].map(limpiar_dinero), errors="coerce")
+    for col in IMPORTES_OPCIONALES:
+        df[col] = df[col].fillna(0)
+    filas_sin_subtotal = int(df["Subtotal_SKU"].isna().sum())
 
     # fecha real (para ordenar bien) y luego texto DD/MM/YYYY
     fecha_real = pd.to_datetime(df["Fecha_Recogida"], errors="coerce", dayfirst=False)
     df["Fecha_Recogida"] = fecha_real.dt.strftime("%d/%m/%Y")
 
-    # ---- Normalizar pais (Cambio 3) ----
+    # ---- Normalizar pais ----
     df["Pais"] = df["Pais"].apply(normalizar_pais)
 
-    # ---- Calculos: Precio_Unitario e IVA (Cambio 2) ----
+    # ---- Calculos: Precio_Unitario e IVA ----
+    # (Subtotal SKU - Descuento SKU + Envio - Descuento Envio) / Qty / 1.21
+    importe_linea = (
+        df["Subtotal_SKU"] - df["Descuento_SKU"]
+        + df["Envio"] - df["Descuento_Envio"]
+    )
     qty_safe = qty.replace(0, pd.NA)          # evita division por cero
-    precio_unitario = df["Total"] / qty_safe / (1 + IVA_TIPO)
+    precio_unitario = importe_linea / qty_safe / (1 + IVA_TIPO)
     df["Precio_Unitario"] = precio_unitario.round(2)
     df["IVA"] = (precio_unitario * IVA_TIPO).round(2)
+    df["Tipo_IVA"] = IVA_TIPO   # se muestra como 21% en el Excel
 
-    # ---- Ordenar por fecha, pais y pedido (Cambio 4) ----
+    # Total de la linea = (Precio_Unitario + IVA) * Qty  (con los valores redondeados)
+    df["Total"] = ((df["Precio_Unitario"] + df["IVA"]) * qty).round(2)
+
+    # ---- Ordenar por pais, cantidad (mayor primero), fecha y pedido ----
+    # (los pedidos sin pais van al final)
     df["_orden_fecha"] = fecha_real
+    df["_orden_pais"] = df["Pais"].replace("", pd.NA)
+    # Qty de mayor a menor; el resto de menor a mayor
     df = df.sort_values(
-        by=["_orden_fecha", "Pais", "ID_Pedido"], na_position="last"
+        by=["_orden_pais", "Qty", "_orden_fecha", "ID_Pedido"],
+        ascending=[True, False, True, True],
+        na_position="last",
     )
-    df = df.drop(columns=["_orden_fecha"]).reset_index(drop=True)
+    df = df.drop(columns=["_orden_fecha", "_orden_pais"]).reset_index(drop=True)
+
+    # ---- Avisos de revision ----
+    pedidos_sin_pais = df.loc[df["Pais"] == "", "ID_Pedido"].unique()
+    lineas_por_pedido = df.groupby("ID_Pedido").size()
+    pedidos_multi_sku = lineas_por_pedido[lineas_por_pedido > 1].index.tolist()
 
     # ---- Factura final (Orders_invoice) ----
     factura = df[ORDEN_FINAL].copy()
@@ -394,7 +453,6 @@ def main():
     # ====================================================================
     hoy = datetime.now()
     fecha_str = hoy.strftime("%Y%m%d")
-    fecha_legible = f"{hoy.day} de {MESES_ES[hoy.month - 1]} de {hoy.year}"
     fecha_corta = hoy.strftime("%d/%m/%Y")   # para los manifiestos
 
     carpeta = crear_carpeta_salida(ruta.parent, fecha_str)
@@ -415,10 +473,13 @@ def main():
             # Qty (E) como entero
             for celda in hoja["E"][1:]:  # saltar cabecera
                 celda.number_format = "0"
-            # importes con 2 decimales (F=Precio_Unitario, G=IVA, H=Total)
-            for col_letra in ("F", "G", "H"):
+            # importes con 2 decimales (F=Precio_Unitario, G=IVA, I=Total)
+            for col_letra in ("F", "G", "I"):
                 for celda in hoja[col_letra][1:]:  # saltar cabecera
                     celda.number_format = "0.00"
+            # Tipo_IVA (H) como porcentaje: 0.21 -> 21%
+            for celda in hoja["H"][1:]:
+                celda.number_format = "0%"
     except PermissionError:
         messagebox.showerror(
             "Error",
@@ -430,14 +491,14 @@ def main():
         messagebox.showerror("Error", f"No se pudo guardar Orders_invoice:\n{e}")
         return
 
-    # ---- Calculo del resumen (Cambio 5) ----
+    # ---- Calculo del resumen ----
     # Order Amount es a nivel de pedido: se toma una sola vez por ID_Pedido
     es_espana = df["Pais"] == "España"
     pedidos_esp = df[es_espana].drop_duplicates(subset="ID_Pedido")
     pedidos_ext = df[~es_espana].drop_duplicates(subset="ID_Pedido")
 
-    esp_total = float(pedidos_esp["Total"].sum())
-    ext_total = float(pedidos_ext["Total"].sum())
+    esp_total = float(pedidos_esp["Order_Amount"].sum())
+    ext_total = float(pedidos_ext["Order_Amount"].sum())
     esp_sin_iva = esp_total / (1 + IVA_TIPO)
     ext_sin_iva = ext_total / (1 + IVA_TIPO)
     esp_n = int(pedidos_esp["ID_Pedido"].nunique())
@@ -501,12 +562,31 @@ def main():
             f"\n\nATENCION: {filas_sin_qty} fila(s) sin Qty. "
             "Revisalas (el Precio_Unitario no se pudo calcular)."
         )
-    if not col_tracking:
+    if filas_sin_subtotal > 0:
         mensaje += (
-            "\n\nATENCION: no se encontro la columna de seguimiento (Tracking) "
-            "en el archivo; los manifiestos saldran SIN numero de seguimiento."
+            f"\n\nATENCION: {filas_sin_subtotal} fila(s) sin "
+            "'SKU Subtotal Before Discount'. "
+            "Revisalas (el Precio_Unitario no se pudo calcular)."
         )
-    messagebox.showinfo("Listo", mensaje)
+    if len(pedidos_sin_pais) > 0:
+        mensaje += (
+            f"\n\nATENCION: {len(pedidos_sin_pais)} pedido(s) SIN PAIS. "
+            "Se han contado como extranjero (manifiesto SEUR y resumen). "
+            f"Revisalos:\n{lista_ids(pedidos_sin_pais)}"
+        )
+    if pedidos_multi_sku:
+        mensaje += (
+            f"\n\nATENCION: {len(pedidos_multi_sku)} pedido(s) con varias lineas "
+            "(varios SKU). Revisa en Orders_invoice que el envio no se haya "
+            "sumado en cada linea:\n"
+            f"{lista_ids(pedidos_multi_sku)}"
+        )
+
+    titulo = "Listo (con avisos)" if "ATENCION" in mensaje else "Listo"
+    if "ATENCION" in mensaje:
+        messagebox.showwarning(titulo, mensaje)
+    else:
+        messagebox.showinfo(titulo, mensaje)
 
 
 if __name__ == "__main__":
