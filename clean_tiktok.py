@@ -7,6 +7,7 @@ Que hace:
 2. Quita la segunda fila de cabecera (la fila de explicaciones).
 3. Se queda solo con las columnas necesarias (incluida la de seguimiento /
    Tracking, que es obligatoria) y las renombra en espanol.
+   La columna Variation (-> Variante) es opcional: si no viene, se deja vacia.
 4. Limpia los importes (quita "EUR", convierte a numero).
 5. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania,
    Österreich -> Austria, etc.).
@@ -33,6 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
 try:
     from docx import Document
@@ -62,6 +64,11 @@ RENOMBRAR = {
     "Shipping Fee Seller Discount": "Descuento_Envio",
 }
 
+# columnas opcionales: si no vienen en el archivo se crean vacias
+COLUMNAS_OPCIONALES = {
+    "Variation": "Variante",
+}
+
 # importes que, si vienen vacios, cuentan como 0
 IMPORTES_OPCIONALES = ["Descuento_SKU", "Envio", "Descuento_Envio"]
 
@@ -75,12 +82,24 @@ ORDEN_FINAL = [
     "ID_Pedido",
     "Fecha_Recogida",
     "Codigo_Producto",
+    "Variante",
     "Qty",
     "Precio_Unitario",
     "IVA",
     "Tipo_IVA",
     "Total",
 ]
+
+# formato de celda en Orders_invoice (por nombre de columna, no por letra,
+# asi no hay que tocar nada al anadir o mover columnas)
+FORMATOS_FACTURA = {
+    "ID_Pedido": "@",
+    "Qty": "0",
+    "Precio_Unitario": "0.00",
+    "IVA": "0.00",
+    "Total": "0.00",
+    "Tipo_IVA": "0%",
+}
 
 # normalizacion de pais (clave en minusculas)
 MAPA_PAIS = {
@@ -379,10 +398,21 @@ def main():
             )
         return
 
-    df = df[COLUMNAS_NECESARIAS + [col_tracking]].copy()
+    # columnas opcionales presentes / ausentes
+    opcionales_presentes = [c for c in COLUMNAS_OPCIONALES if c in df.columns]
+    opcionales_ausentes = [c for c in COLUMNAS_OPCIONALES if c not in df.columns]
+
+    df = df[COLUMNAS_NECESARIAS + opcionales_presentes + [col_tracking]].copy()
     df = df.rename(columns=RENOMBRAR)
+    df = df.rename(columns=COLUMNAS_OPCIONALES)
     df = df.rename(columns={col_tracking: "Tracking"})
     df["Tracking"] = df["Tracking"].apply(limpiar_order_id)
+
+    # crear vacias las opcionales que no vengan y limpiar el texto
+    for nombre in COLUMNAS_OPCIONALES.values():
+        if nombre not in df.columns:
+            df[nombre] = ""
+        df[nombre] = df[nombre].fillna("").astype(str).str.strip()
 
     filas_iniciales = len(df)
 
@@ -467,19 +497,17 @@ def main():
         with pd.ExcelWriter(orders_path, engine="openpyxl") as writer:
             factura.to_excel(writer, index=False, sheet_name="Pedidos")
             hoja = writer.sheets["Pedidos"]
-            # ID_Pedido es la columna B -> forzar texto
-            for celda in hoja["B"]:
-                celda.number_format = "@"
-            # Qty (E) como entero
-            for celda in hoja["E"][1:]:  # saltar cabecera
-                celda.number_format = "0"
-            # importes con 2 decimales (F=Precio_Unitario, G=IVA, I=Total)
-            for col_letra in ("F", "G", "I"):
-                for celda in hoja[col_letra][1:]:  # saltar cabecera
-                    celda.number_format = "0.00"
-            # Tipo_IVA (H) como porcentaje: 0.21 -> 21%
-            for celda in hoja["H"][1:]:
-                celda.number_format = "0%"
+            # formatos por nombre de columna (la letra se calcula sola)
+            for nombre_col, formato in FORMATOS_FACTURA.items():
+                if nombre_col not in ORDEN_FINAL:
+                    continue
+                letra = get_column_letter(ORDEN_FINAL.index(nombre_col) + 1)
+                celdas = hoja[letra]
+                # ID_Pedido (texto) incluye la cabecera; el resto la salta
+                if formato != "@":
+                    celdas = celdas[1:]
+                for celda in celdas:
+                    celda.number_format = formato
     except PermissionError:
         messagebox.showerror(
             "Error",
@@ -557,6 +585,12 @@ def main():
         f"Pedidos España: {esp_n}    Pedidos extranjero: {ext_n}\n"
         f"Filas eliminadas sin ID_Pedido: {filas_sin_id}"
     )
+    if opcionales_ausentes:
+        mensaje += (
+            "\n\nNota: el archivo no trae la(s) columna(s) "
+            + ", ".join(opcionales_ausentes)
+            + ". Se han dejado vacias en Orders_invoice."
+        )
     if filas_sin_qty > 0:
         mensaje += (
             f"\n\nATENCION: {filas_sin_qty} fila(s) sin Qty. "
