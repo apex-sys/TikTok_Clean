@@ -8,22 +8,28 @@ Que hace:
 3. Se queda solo con las columnas necesarias (incluida la de seguimiento /
    Tracking, que es obligatoria) y las renombra en espanol.
    La columna Variation (-> Variante) es opcional: si no viene, se deja vacia.
-4. Limpia los importes (quita "EUR", convierte a numero).
-5. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania,
-   Österreich -> Austria, etc.).
-6. Calcula Precio_Unitario e IVA (21% del unitario):
+4. Detecta la moneda de cada linea (EUR, HUF, ...) a partir de una columna
+   de moneda si existe, o del texto de los importes ("HUF 4,990", "EUR 12.34").
+   Si no se puede detectar, se asume EUR.
+5. Limpia los importes (quita el codigo de moneda, convierte a numero).
+6. Normaliza el pais (Spain/España -> España, Germany/Deutschland -> Alemania,
+   Österreich -> Austria, Magyarország -> Hungría, etc.).
+7. Calcula Precio_Unitario e IVA (21% del unitario):
      Precio_Unitario = (SKU Subtotal Before Discount - SKU Seller Discount
                         + Original Shipping Fee - Shipping Fee Seller Discount)
                        / Qty / 1.21
    Anade Tipo_IVA (21%) y Total = (Precio_Unitario + IVA) * Qty.
-7. Convierte Shipped Time a Fecha_Recogida en formato DD/MM/YYYY.
-8. Ordena por Pais, Qty (de mayor a menor), Fecha_Recogida e ID_Pedido.
-9. Crea una carpeta "YYYYMMDD_N" junto al original y dentro genera:
+   Los importes quedan en la moneda original de cada pedido (columna Moneda).
+8. Convierte Shipped Time a Fecha_Recogida y Paid Time a Fecha_Pedido,
+   ambas en formato DD/MM/YYYY.
+9. Ordena por Pais, Qty (de mayor a menor), Fecha_Recogida e ID_Pedido.
+10. Crea una carpeta "YYYYMMDD_N" junto al original y dentro genera:
      - Orders_invoice.xlsx
-     - Resumen_YYYYMMDD.xlsx
+     - Resumen_YYYYMMDD.xlsx  (separado por moneda)
      - MANIFIESTO DE ENTREGA_SEUR_YYYYMMDD.docx  (pedidos NO Espana)
      - MANIFIESTO DE ENTREGA_CTT_YYYYMMDD.docx   (pedidos Espana)
-10. Avisa de pedidos sin pais y de pedidos con varias lineas (varios SKU).
+11. Avisa de pedidos sin pais, de pedidos con varias lineas (varios SKU)
+    y de pedidos en moneda distinta de EUR.
 """
 
 import re
@@ -56,6 +62,7 @@ RENOMBRAR = {
     "Quantity": "Qty",
     "Order Amount": "Order_Amount",
     "Shipped Time": "Fecha_Recogida",
+    "Paid Time": "Fecha_Pedido",
     "Country": "Pais",
     # importes para calcular Precio_Unitario
     "SKU Subtotal Before Discount": "Subtotal_SKU",
@@ -72,6 +79,10 @@ COLUMNAS_OPCIONALES = {
 # importes que, si vienen vacios, cuentan como 0
 IMPORTES_OPCIONALES = ["Descuento_SKU", "Envio", "Descuento_Envio"]
 
+# importes (todavia como texto) de los que se intenta sacar la moneda, en orden
+IMPORTES_PARA_MONEDA = ["Order_Amount", "Subtotal_SKU", "Envio",
+                        "Descuento_SKU", "Descuento_Envio"]
+
 COLUMNAS_NECESARIAS = list(RENOMBRAR.keys())
 # Ademas es obligatoria una columna de seguimiento (cualquier columna
 # cuyo nombre contenga "tracking", p. ej. "Tracking ID").
@@ -81,9 +92,11 @@ ORDEN_FINAL = [
     "Pais",
     "ID_Pedido",
     "Fecha_Recogida",
+    "Fecha_Pedido",
     "Codigo_Producto",
     "Variante",
     "Qty",
+    "Moneda",
     "Precio_Unitario",
     "IVA",
     "Tipo_IVA",
@@ -117,6 +130,22 @@ MAPA_PAIS = {
     "österreich": "Austria",
     "osterreich": "Austria",
     "oesterreich": "Austria",
+    "magyarország": "Hungría",
+    "magyarorszag": "Hungría",
+    "hungary": "Hungría",
+    "hungría": "Hungría",
+    "hungria": "Hungría",
+}
+
+# moneda
+MONEDA_POR_DEFECTO = "EUR"
+# simbolos que pueden aparecer en lugar del codigo ISO
+SIMBOLOS_MONEDA = {
+    "€": "EUR",
+    "Ft": "HUF",
+    "£": "GBP",
+    "zł": "PLN",
+    "Kč": "CZK",
 }
 
 MESES_ES = [
@@ -133,13 +162,19 @@ MAX_IDS_EN_AVISO = 10  # cuantos ID de pedido se listan en cada aviso
 # Funciones de limpieza
 # ----------------------------------------------------------------------
 def limpiar_dinero(valor):
-    """Convierte 'EUR 12.34', '12,34 EUR', '€12.34' ... en el numero 12.34"""
+    """
+    Convierte 'EUR 12.34', '12,34 EUR', '€12.34', 'HUF 4,990', '4.990 Ft' ...
+    en un numero.
+
+    Si solo hay un tipo de separador:
+      - si aparece varias veces, o va seguido de exactamente 3 cifras,
+        es separador de miles ('4,990' -> 4990, '1.250.000' -> 1250000);
+      - si no, es separador decimal ('12,34' -> 12.34).
+    """
     if pd.isna(valor):
         return None
-    texto = str(valor)
-    texto = re.sub(r"(?i)eur", "", texto)
-    texto = texto.replace("€", "").replace("\u00a0", "").strip()
-    texto = re.sub(r"[^\d,.\-]", "", texto)
+    texto = str(valor).replace("\u00a0", "").strip()
+    texto = re.sub(r"[^\d,.\-]", "", texto)   # quita letras y simbolos de moneda
     if texto in ("", "-", ".", ","):
         return None
     if "," in texto and "." in texto:
@@ -147,12 +182,37 @@ def limpiar_dinero(valor):
             texto = texto.replace(".", "").replace(",", ".")
         else:
             texto = texto.replace(",", "")
-    elif "," in texto:
-        texto = texto.replace(",", ".")
+    else:
+        sep = "," if "," in texto else ("." if "." in texto else None)
+        if sep:
+            partes = texto.split(sep)
+            if len(partes) > 2 or len(partes[-1]) == 3:
+                texto = texto.replace(sep, "")      # miles
+            else:
+                texto = texto.replace(sep, ".")     # decimal
     try:
         return float(texto)
     except ValueError:
         return None
+
+
+def detectar_moneda(*valores):
+    """
+    Busca la moneda en el texto de los importes: primero un codigo de
+    3 letras (EUR, HUF, ...), luego simbolos (€, Ft, ...).
+    Devuelve "" si no encuentra nada.
+    """
+    for v in valores:
+        if pd.isna(v):
+            continue
+        texto = str(v).strip()
+        m = re.search(r"(?<![A-Za-z])([A-Za-z]{3})(?![A-Za-z])", texto)
+        if m:
+            return m.group(1).upper()
+        for simbolo, codigo in SIMBOLOS_MONEDA.items():
+            if simbolo in texto:
+                return codigo
+    return ""
 
 
 def limpiar_order_id(valor):
@@ -177,6 +237,14 @@ def detectar_columna_tracking(columnas):
     """Busca la columna de seguimiento (Tracking ID, Tracking Number, ...)."""
     for c in columnas:
         if "tracking" in str(c).lower():
+            return c
+    return None
+
+
+def detectar_columna_moneda(columnas):
+    """Busca una columna de moneda (Currency, ...) si TikTok la incluye."""
+    for c in columnas:
+        if "currency" in str(c).lower():
             return c
     return None
 
@@ -374,6 +442,7 @@ def main():
 
     # ---- Comprobar columnas (Tracking incluido, es obligatorio) ----
     col_tracking = detectar_columna_tracking(df.columns)
+    col_moneda = detectar_columna_moneda(df.columns)   # opcional
 
     faltan = [c for c in COLUMNAS_NECESARIAS if c not in df.columns]
     if col_tracking is None:
@@ -402,10 +471,16 @@ def main():
     opcionales_presentes = [c for c in COLUMNAS_OPCIONALES if c in df.columns]
     opcionales_ausentes = [c for c in COLUMNAS_OPCIONALES if c not in df.columns]
 
-    df = df[COLUMNAS_NECESARIAS + opcionales_presentes + [col_tracking]].copy()
+    columnas_a_usar = COLUMNAS_NECESARIAS + opcionales_presentes + [col_tracking]
+    if col_moneda is not None:
+        columnas_a_usar.append(col_moneda)
+
+    df = df[columnas_a_usar].copy()
     df = df.rename(columns=RENOMBRAR)
     df = df.rename(columns=COLUMNAS_OPCIONALES)
     df = df.rename(columns={col_tracking: "Tracking"})
+    if col_moneda is not None:
+        df = df.rename(columns={col_moneda: "Moneda_Origen"})
     df["Tracking"] = df["Tracking"].apply(limpiar_order_id)
 
     # crear vacias las opcionales que no vengan y limpiar el texto
@@ -420,6 +495,19 @@ def main():
     df["ID_Pedido"] = df["ID_Pedido"].apply(limpiar_order_id)
     df = df[df["ID_Pedido"].notna()].reset_index(drop=True)
     filas_sin_id = filas_iniciales - len(df)
+
+    # ---- Moneda (antes de limpiar los importes, que pierden el texto) ----
+    def moneda_fila(fila):
+        if "Moneda_Origen" in fila.index and pd.notna(fila["Moneda_Origen"]):
+            m = str(fila["Moneda_Origen"]).strip().upper()
+            if m:
+                return m
+        detectada = detectar_moneda(*(fila[c] for c in IMPORTES_PARA_MONEDA))
+        return detectada or MONEDA_POR_DEFECTO
+
+    df["Moneda"] = df.apply(moneda_fila, axis=1) if len(df) else ""
+    if "Moneda_Origen" in df.columns:
+        df = df.drop(columns=["Moneda_Origen"])
 
     qty = pd.to_numeric(df["Qty"], errors="coerce")
     filas_sin_qty = int(qty.isna().sum())
@@ -436,9 +524,14 @@ def main():
         df[col] = df[col].fillna(0)
     filas_sin_subtotal = int(df["Subtotal_SKU"].isna().sum())
 
-    # fecha real (para ordenar bien) y luego texto DD/MM/YYYY
-    fecha_real = pd.to_datetime(df["Fecha_Recogida"], errors="coerce", dayfirst=False)
+    # fechas reales (para ordenar bien) y luego texto DD/MM/YYYY
+    fecha_real = pd.to_datetime(df["Fecha_Recogida"], errors="coerce",
+                                dayfirst=False, format="mixed")
     df["Fecha_Recogida"] = fecha_real.dt.strftime("%d/%m/%Y")
+
+    fecha_pedido = pd.to_datetime(df["Fecha_Pedido"], errors="coerce",
+                                  dayfirst=False, format="mixed")
+    df["Fecha_Pedido"] = fecha_pedido.dt.strftime("%d/%m/%Y")
 
     # ---- Normalizar pais ----
     df["Pais"] = df["Pais"].apply(normalizar_pais)
@@ -474,6 +567,9 @@ def main():
     pedidos_sin_pais = df.loc[df["Pais"] == "", "ID_Pedido"].unique()
     lineas_por_pedido = df.groupby("ID_Pedido").size()
     pedidos_multi_sku = lineas_por_pedido[lineas_por_pedido > 1].index.tolist()
+    no_eur = df["Moneda"] != MONEDA_POR_DEFECTO
+    pedidos_no_eur = df.loc[no_eur, "ID_Pedido"].unique()
+    monedas_no_eur = sorted(df.loc[no_eur, "Moneda"].unique())
 
     # ---- Factura final (Orders_invoice) ----
     factura = df[ORDEN_FINAL].copy()
@@ -519,36 +615,46 @@ def main():
         messagebox.showerror("Error", f"No se pudo guardar Orders_invoice:\n{e}")
         return
 
-    # ---- Calculo del resumen ----
+    # ---- Calculo del resumen (por moneda: no se suman EUR y HUF) ----
     # Order Amount es a nivel de pedido: se toma una sola vez por ID_Pedido
     es_espana = df["Pais"] == "España"
-    pedidos_esp = df[es_espana].drop_duplicates(subset="ID_Pedido")
-    pedidos_ext = df[~es_espana].drop_duplicates(subset="ID_Pedido")
+    esp_n = int(df.loc[es_espana, "ID_Pedido"].nunique())
+    ext_n = int(df.loc[~es_espana, "ID_Pedido"].nunique())
 
-    esp_total = float(pedidos_esp["Order_Amount"].sum())
-    ext_total = float(pedidos_ext["Order_Amount"].sum())
-    esp_sin_iva = esp_total / (1 + IVA_TIPO)
-    ext_sin_iva = ext_total / (1 + IVA_TIPO)
-    esp_n = int(pedidos_esp["ID_Pedido"].nunique())
-    ext_n = int(pedidos_ext["ID_Pedido"].nunique())
+    # EUR primero, luego el resto por orden alfabetico
+    monedas = sorted(df["Moneda"].unique(),
+                     key=lambda m: (m != MONEDA_POR_DEFECTO, m))
 
-    filas_resumen = [
-        ("España sin IVA", round(esp_sin_iva, 2)),
-        ("España Total", round(esp_total, 2)),
-        ("Numero de pedidos", esp_n),
-        ("Extranjero sin IVA", round(ext_sin_iva, 2)),
-        ("Extranjero Total", round(ext_total, 2)),
-        ("Numero de pedidos", ext_n),
-    ]
+    filas_resumen = []   # (etiqueta, valor, moneda)
+    for moneda in monedas:
+        sub = df[df["Moneda"] == moneda]
+        sub_esp = sub["Pais"] == "España"
+        pedidos_esp = sub[sub_esp].drop_duplicates(subset="ID_Pedido")
+        pedidos_ext = sub[~sub_esp].drop_duplicates(subset="ID_Pedido")
+
+        esp_total = float(pedidos_esp["Order_Amount"].sum())
+        ext_total = float(pedidos_ext["Order_Amount"].sum())
+
+        if filas_resumen:
+            filas_resumen.append(("", None, ""))   # linea en blanco entre monedas
+        filas_resumen += [
+            ("España sin IVA", round(esp_total / (1 + IVA_TIPO), 2), moneda),
+            ("España Total", round(esp_total, 2), moneda),
+            ("Numero de pedidos", int(pedidos_esp["ID_Pedido"].nunique()), ""),
+            ("Extranjero sin IVA", round(ext_total / (1 + IVA_TIPO), 2), moneda),
+            ("Extranjero Total", round(ext_total, 2), moneda),
+            ("Numero de pedidos", int(pedidos_ext["ID_Pedido"].nunique()), ""),
+        ]
 
     try:
         from openpyxl import Workbook
         wb = Workbook()
         ws = wb.active
         ws.title = "Resumen"
-        for i, (etiqueta, valor) in enumerate(filas_resumen, start=1):
+        for i, (etiqueta, valor, moneda) in enumerate(filas_resumen, start=1):
             ws.cell(row=i, column=1, value=etiqueta)
             ws.cell(row=i, column=2, value=valor)
+            ws.cell(row=i, column=3, value=moneda)
         wb.save(resumen_path)
     except Exception as e:
         messagebox.showerror("Error", f"No se pudo guardar el Resumen:\n{e}")
@@ -614,6 +720,14 @@ def main():
             "(varios SKU). Revisa en Orders_invoice que el envio no se haya "
             "sumado en cada linea:\n"
             f"{lista_ids(pedidos_multi_sku)}"
+        )
+    if len(pedidos_no_eur) > 0:
+        mensaje += (
+            f"\n\nATENCION: {len(pedidos_no_eur)} pedido(s) en moneda distinta "
+            f"de {MONEDA_POR_DEFECTO} ({', '.join(monedas_no_eur)}). "
+            "Sus importes estan en su moneda original (columna Moneda) y el "
+            "Resumen los muestra por separado. Revisa el tipo de IVA aplicado:\n"
+            f"{lista_ids(pedidos_no_eur)}"
         )
 
     titulo = "Listo (con avisos)" if "ATENCION" in mensaje else "Listo"
